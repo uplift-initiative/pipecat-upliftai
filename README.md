@@ -67,7 +67,7 @@ Common UpliftAI voices:
 | --- | --- | --- |
 | `v_meklc281` *(default)* | Urdu | Female |
 
-Browse the full catalog at [studio.upliftai.org](https://platform.upliftai.org/studio/home).
+Browse the full catalog at [docs.upliftai.org/orator_voices](https://docs.upliftai.org/orator_voices).
 
 ## Runtime settings updates
 
