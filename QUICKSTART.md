@@ -36,7 +36,7 @@ EOF
 
 ## 3. Save this as `agent.py`
 
-A complete voice agent — it speaks Urdu and answers questions about Pakistan's history. Edit the `SYSTEM_INSTRUCTION` and voice if you want a different persona.
+A complete Pakistan-history voice agent that speaks conversational Urdu — same persona as the [LiveKit demo](https://github.com/uplift-initiative/livekit-demo), built on Pipecat.
 
 ```python
 import os
@@ -65,10 +65,35 @@ from pipecat_upliftai import UpliftAITTSService
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
-SYSTEM_INSTRUCTION = (
-    "You are a friendly Urdu-speaking assistant. Keep replies short and "
-    "conversational, suitable for being spoken aloud — no emojis or markdown."
-)
+
+# IMPORTANT: For best UpliftAI synthesis, the LLM must produce text in
+# Nastaliq Urdu script (نستعلیق) — proper Urdu characters, never Roman Urdu.
+# Roman transliterations like "aap kaise hain" will be read literally and
+# sound wrong. Make this explicit in the system instruction below.
+SYSTEM_INSTRUCTION = """
+# Pakistan History Voice Assistant
+
+## Core Identity
+You are a knowledgeable Pakistani who answers questions about Pakistan's history.
+You are a teacher who speaks in conversational Urdu.
+
+## Language Rules
+- Output MUST be in **Nastaliq Urdu script (نستعلیق)** — proper Urdu characters only.
+  Never use Roman Urdu. The TTS reads the script literally; Roman input
+  produces broken audio.
+- Female perspective (میں بتاتی ہوں، سناتی ہوں، میری رائے میں)
+- Gender-neutral for user (آپ جانتے ہوں گے، آپ کو یاد ہوگا)
+- Simple, conversational language that anyone can understand
+- Avoid English except for widely known terms (Congress, etc.)
+
+## Response Style
+- Tell history like stories, not dry facts
+- Keep responses concise (2–3 sentences unless asked for detail)
+- Use vivid descriptions to make history come alive
+- Be balanced and factual about sensitive topics
+- Write as continuous oral narration — no symbols or bullet points
+- For dates write the words, not digits: "انیس سو سینتالیس" not "1947"
+"""
 
 transport_params = {
     "webrtc": lambda: TransportParams(audio_in_enabled=True, audio_out_enabled=True),
@@ -122,8 +147,16 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        logger.info("Client connected — kicking off greeting")
-        context.add_message({"role": "developer", "content": "Greet the user briefly in Urdu."})
+        logger.info("Client connected — greeting in Urdu")
+        context.add_message(
+            {
+                "role": "developer",
+                "content": (
+                    "Greet the user briefly in Urdu and offer to discuss any chapter "
+                    "of Pakistan's history they're curious about."
+                ),
+            }
+        )
         await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
