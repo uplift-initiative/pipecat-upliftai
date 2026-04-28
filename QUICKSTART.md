@@ -1,145 +1,222 @@
 # Quickstart — `pipecat-upliftai`
 
-Five-minute guide to using the UpliftAI TTS plugin for Pipecat. For full
-docs, see [README.md](README.md).
+Get a real voice agent talking in your browser in five minutes.
 
 ## Prerequisites
 
 - Python **3.11+**
-- An UpliftAI API key — get one at [platform.upliftai.org/studio](https://platform.upliftai.org/studio/home)
+- An **UpliftAI API key** — [platform.upliftai.org/studio](https://platform.upliftai.org/studio/home)
+- An **OpenAI API key** (used in the example for STT + LLM) — [platform.openai.com/api-keys](https://platform.openai.com/account/api-keys)
 
-## 1. Install
+You can swap OpenAI for any STT/LLM Pipecat supports later — Deepgram, Anthropic, Gemini, etc. Using OpenAI here just because it's the shortest path to a working bot.
 
-The plugin isn't on PyPI yet. Install it straight from GitHub:
+## 1. Set up the project
 
 ```bash
-pip install "pipecat-upliftai @ git+https://github.com/uplift-initiative/pipecat-upliftai.git@main"
+mkdir uplift-agent && cd uplift-agent
+python -m venv .venv
+source .venv/bin/activate
+
+pip install \
+  "pipecat-upliftai @ git+https://github.com/uplift-initiative/pipecat-upliftai.git@main" \
+  "pipecat-ai[openai,silero,webrtc,runner]>=1.1.0" \
+  python-dotenv
 ```
 
-This also pulls in `pipecat-ai` and `websockets` automatically.
+The `pipecat-ai` extras pull in OpenAI (STT + LLM), Silero VAD, Pipecat's small-WebRTC transport (browser UI), and the runner CLI.
 
-## 2. Synthesize text → audio (minimal sanity check)
+## 2. Add your keys
 
-Save this as `smoke.py`:
+```bash
+cat > .env <<EOF
+OPENAI_API_KEY=sk-...
+UPLIFTAI_API_KEY=...
+EOF
+```
+
+## 3. Save this as `agent.py`
+
+A complete voice agent — it speaks Urdu and answers questions about Pakistan's history. Edit the `SYSTEM_INSTRUCTION` and voice if you want a different persona.
 
 ```python
-import asyncio, os, wave
+import os
+from pathlib import Path
 
-from pipecat.frames.frames import EndFrame, LLMFullResponseEndFrame, LLMTextFrame, TTSAudioRawFrame
+from dotenv import load_dotenv
+from loguru import logger
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.frame_processor import FrameProcessor
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.stt import OpenAISTTService
+from pipecat.transports.base_transport import BaseTransport, TransportParams
 
 from pipecat_upliftai import UpliftAITTSService
 
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
-class WavSink(FrameProcessor):
-    def __init__(self, path):
-        super().__init__()
-        self._wav = wave.open(path, "wb")
-        self._wav.setnchannels(1); self._wav.setsampwidth(2); self._wav.setframerate(22050)
+SYSTEM_INSTRUCTION = (
+    "You are a friendly Urdu-speaking assistant. Keep replies short and "
+    "conversational, suitable for being spoken aloud — no emojis or markdown."
+)
 
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, TTSAudioRawFrame):
-            self._wav.writeframes(frame.audio)
-        await self.push_frame(frame, direction)
+transport_params = {
+    "webrtc": lambda: TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+}
 
 
-async def main():
-    tts = UpliftAITTSService(api_key=os.environ["UPLIFTAI_API_KEY"])
-    pipeline = Pipeline([tts, WavSink("out.wav")])
-    task = PipelineTask(pipeline, params=PipelineParams(audio_out_sample_rate=22050))
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> None:
+    stt = OpenAISTTService(
+        api_key=os.environ["OPENAI_API_KEY"],
+        settings=OpenAISTTService.Settings(model="gpt-4o-transcribe", language="ur"),
+    )
+    llm = OpenAILLMService(
+        api_key=os.environ["OPENAI_API_KEY"],
+        settings=OpenAILLMService.Settings(
+            model="gpt-4o-mini",
+            system_instruction=SYSTEM_INSTRUCTION,
+        ),
+    )
+    tts = UpliftAITTSService(
+        api_key=os.environ["UPLIFTAI_API_KEY"],
+        settings=UpliftAITTSService.Settings(
+            voice="v_meklc281",          # browse voices: https://docs.upliftai.org/orator_voices
+            output_format="PCM_22050_16",
+        ),
+    )
 
-    async def feed():
-        await asyncio.sleep(0.1)
-        await task.queue_frames([
-            LLMTextFrame("Hello from UpliftAI through Pipecat."),
-            LLMFullResponseEndFrame(),
-        ])
-        await asyncio.sleep(6.0)
-        await task.queue_frame(EndFrame())
+    context = LLMContext()
+    user_agg, assistant_agg = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+    )
 
-    runner = PipelineRunner(handle_sigint=False)
-    await asyncio.gather(runner.run(task), feed())
+    pipeline = Pipeline([
+        transport.input(),
+        stt,
+        user_agg,
+        llm,
+        tts,
+        transport.output(),
+        assistant_agg,
+    ])
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            audio_out_sample_rate=22050,    # MUST match the UpliftAI output_format above
+            enable_metrics=True,
+        ),
+        idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
+    )
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("Client connected — kicking off greeting")
+        context.add_message({"role": "developer", "content": "Greet the user briefly in Urdu."})
+        await task.queue_frames([LLMRunFrame()])
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        await task.cancel()
+
+    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+    await runner.run(task)
+
+
+async def bot(runner_args: RunnerArguments) -> None:
+    transport = await create_transport(runner_args, transport_params)
+    await run_bot(transport, runner_args)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    from pipecat.runner.run import main
+    main()
 ```
 
-Run it:
+## 4. Run it
 
 ```bash
-export UPLIFTAI_API_KEY=your_key_here
-python smoke.py
-ls -lh out.wav            # should be ~80–120 KB of 22050 Hz PCM
-afplay out.wav            # macOS; or `aplay out.wav` / `ffplay out.wav`
+python agent.py -t webrtc
 ```
 
-If you hear the line spoken, the plugin works.
+Open **http://localhost:7860** in a browser, click "Connect", and talk to the bot. The first time you'll see a mic-permission prompt.
 
-## 3. Use it in a real voice agent
+## What's in the pipeline?
 
-The full Pakistan-history Urdu voice agent example is in
-[`examples/voice_agent.py`](examples/voice_agent.py) — drop the
-`UpliftAITTSService` into a Pipecat pipeline alongside any STT and LLM
-of your choice:
-
-```python
-pipeline = Pipeline([
-    transport.input(),
-    stt,                  # e.g. OpenAISTTService
-    user_aggregator,
-    llm,                  # e.g. OpenAILLMService
-    tts,                  # ← UpliftAITTSService
-    transport.output(),
-    assistant_aggregator,
-])
+```
+[mic ► browser] ─► transport.input
+                  └─► STT      (OpenAI gpt-4o-transcribe — Urdu)
+                  └─► user aggregator   (Silero VAD detects end of utterance)
+                  └─► LLM      (OpenAI gpt-4o-mini)
+                  └─► TTS      ← UpliftAITTSService
+                  └─► transport.output ─► [speaker]
+                  └─► assistant aggregator
 ```
 
-A complete runnable demo (browser UI, Daily, or Twilio transports) is at
-**[uplift-initiative/pipecat-upliftai-demo](https://github.com/uplift-initiative/pipecat-upliftai-demo)** *(if/once published — otherwise ask Zaid)*.
+You can replace any block — keep `UpliftAITTSService` and swap STT/LLM/transport however you like.
 
-## 4. Important: sample-rate constraint
-
-UpliftAI's wire format hard-locks the audio rate. The pipeline's
-`audio_out_sample_rate` (or the service's `sample_rate=` argument) must
-match — `start()` raises `ValueError` on mismatch.
-
-| `output_format` | Required pipeline rate |
-| --- | --- |
-| `PCM_22050_16` *(default)* | `22050` |
-| `WAV_22050_*`, `MP3_22050_*`, `OGG_22050_16` | `22050` |
-| `ULAW_8000_8` *(for telephony — Twilio/Plivo/etc.)* | `8000` |
-
-## 5. Customising
+## Customising the voice
 
 ```python
-from pipecat_upliftai import UpliftAITTSService
-
 tts = UpliftAITTSService(
     api_key=os.environ["UPLIFTAI_API_KEY"],
     settings=UpliftAITTSService.Settings(
-        voice="v_meklc281",                 # browse: https://docs.upliftai.org/orator_voices
-        output_format="PCM_22050_16",       # or MP3_22050_64 / ULAW_8000_8 / etc.
-        phrase_replacement_config_id=None,  # optional server-side phrase replacement
+        voice="v_meklc281",                  # see https://docs.upliftai.org/orator_voices
+        output_format="MP3_22050_64",        # or PCM_22050_16, ULAW_8000_8, etc.
+        phrase_replacement_config_id=None,   # optional, server-side phrase replacement
     ),
 )
 ```
 
+If you change `output_format`, **also update** `audio_out_sample_rate` on `PipelineParams`:
+- All `*_22050_*` formats → `22050`
+- `ULAW_8000_8` (telephony) → `8000`
+
+`start()` will raise a clear `ValueError` if they don't match — fail-fast, no silent garbled audio.
+
+## Going to production transports
+
+The example uses Pipecat's small-WebRTC server (good for dev). To run on Daily, Twilio, etc., add to `transport_params` and run with the matching `-t` flag:
+
+```python
+from pipecat.transports.daily.transport import DailyParams
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
+
+transport_params = {
+    "webrtc": lambda: TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+    "daily":  lambda: DailyParams(audio_in_enabled=True, audio_out_enabled=True),
+    "twilio": lambda: FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True),
+}
+```
+
+```bash
+python agent.py -t daily       # needs DAILY_API_KEY
+python agent.py -t twilio -x your.ngrok.io
+```
+
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-| --- | --- | --- |
-| `ValueError: sample_rate=… does not match output_format=…` | Pipeline rate ≠ format-implied rate | Set `audio_out_sample_rate` on `PipelineParams` to match (22050 for PCM/WAV/MP3/OGG, 8000 for ULAW). |
-| `Unable to connect to UpliftAI TTS: 401` | Bad/missing API key | Verify `UPLIFTAI_API_KEY` env var is set and correct. |
-| Audio sounds garbled / interleaved | (Should not happen — gate prevents it) | Update to latest plugin; file an issue. |
-| `ModuleNotFoundError: No module named 'websockets'` | Old install missed the dep | `pip install -U "pipecat-upliftai @ git+https://github.com/uplift-initiative/pipecat-upliftai.git@main"` |
+| Symptom | Fix |
+| --- | --- |
+| `ValueError: sample_rate=… does not match output_format=…` | Set `audio_out_sample_rate` on `PipelineParams` to match the format (22050 for PCM/WAV/MP3/OGG, 8000 for ULAW). |
+| `Unable to connect to UpliftAI TTS: 401` | Check `UPLIFTAI_API_KEY` is set and valid. |
+| `KeyError: 'OPENAI_API_KEY'` | Your `.env` isn't being loaded — confirm `.env` lives next to `agent.py` and contains the key. |
+| Bot greets but never replies after you talk | Likely STT issue — confirm `OPENAI_API_KEY` and your mic is producing audio (most browsers show a mic indicator on the tab). |
+| Audio sounds garbled / interleaved | Should not happen with the gate fix; if it does, please file an issue with the agent log. |
 
 ## Support
 
-- Issues: https://github.com/uplift-initiative/pipecat-upliftai/issues
-- UpliftAI docs: https://docs.upliftai.org
-- Pipecat docs: https://docs.pipecat.ai
+- **Issues**: https://github.com/uplift-initiative/pipecat-upliftai/issues
+- **UpliftAI docs**: https://docs.upliftai.org
+- **Pipecat docs**: https://docs.pipecat.ai
