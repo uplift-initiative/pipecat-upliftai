@@ -6,7 +6,7 @@
 
 ## Features
 
-- Streaming PCM, WAV, MP3, OGG, or μ-law (ULAW) output
+- Streaming 22.05 kHz raw-PCM output
 - Multiple synthesize requests multiplexed on a single WebSocket
 - Server-side cancellation on bot interruption
 - Optional server-side phrase replacement
@@ -33,6 +33,7 @@ tts = UpliftAITTSService(
     settings=UpliftAITTSService.Settings(
         voice="v_meklc281",          # default Urdu voice
         output_format="PCM_22050_16",
+        speed=1.0,                   # 0.5–2.0, 1.0 is the normal rate
     ),
 )
 
@@ -42,22 +43,15 @@ tts = UpliftAITTSService(
 
 For a complete voice-agent example see [`examples/voice_agent.py`](examples/voice_agent.py).
 
-## Sample-rate constraint
+## Output format and sample rate
 
-UpliftAI's wire format hard-locks the audio rate:
+`PCM_22050_16` is the only usable `output_format`, and the pipeline must run at **22050 Hz**.
 
-| `output_format` | Rate |
-| --- | --- |
-| `PCM_22050_16`, `WAV_22050_16`, `WAV_22050_32`, `MP3_22050_32`, `MP3_22050_64`, `MP3_22050_128`, `OGG_22050_16` | 22050 Hz |
-| `ULAW_8000_8` | 8000 Hz |
+Pipecat carries TTS audio on `TTSAudioRawFrame`, which is defined as raw 16-bit PCM, and this service hands UpliftAI's bytes straight to that frame. UpliftAI's other wire formats (MP3, OGG, WAV, ULAW) are encoded or 8-bit, so they would be interpreted as PCM samples and played back as noise. They are rejected at configuration time rather than producing broken audio.
 
-The pipeline's `audio_out_sample_rate` (or the service's `sample_rate=` argument) must match. `start()` raises `ValueError` on mismatch — fail-fast at configuration time rather than silently producing audio at the wrong rate.
+Set the rate with the pipeline's `audio_out_sample_rate`, or the service's `sample_rate=` argument. `start()` raises `ValueError` on a mismatch — fail-fast at configuration time rather than silently producing audio at the wrong rate.
 
-## When to pick which format
-
-- **`PCM_22050_16` (default)** — best for WebRTC transports (Daily, LiveKit, Pipecat WebRTC). Pipecat's audio pipeline is PCM-native; downstream processors resample as needed.
-- **`MP3_22050_*`** — smaller payloads if your transport doesn't decode raw PCM.
-- **`ULAW_8000_8`** — for telephony serializers (Twilio, Plivo, Telnyx, Vonage, Exotel, Genesys). Skips a μ-law encode + downsample on every frame.
+**Telephony transports still want PCM here.** Pipecat's serializers (Twilio, Plivo, Telnyx, Vonage, Exotel, Genesys) call `pcm_to_ulaw()` on outgoing audio themselves, so they convert at the transport edge; sending μ-law from the TTS would double-encode it.
 
 ## Voice IDs
 
@@ -74,11 +68,12 @@ Browse the full catalog at [docs.upliftai.org/orator_voices](https://docs.uplift
 `UpliftAITTSSettings` supports runtime updates via Pipecat's standard `TTSUpdateSettingsFrame` mechanism:
 
 - `voice`, `phrase_replacement_config_id` — apply on the next synthesize request
-- `output_format` — applies on the next synthesize request **only if** the implied rate still matches the pipeline rate; otherwise the change is rejected and an error is pushed
+- `speed` — applies on the next synthesize request, if within UpliftAI's 0.5–2.0 range; otherwise the change is rolled back and an error is pushed
+- `output_format` — applies on the next synthesize request **only if** it remains usable (raw PCM at the pipeline's rate); otherwise the change is rolled back and an error is pushed
 
 ## Compatibility
 
-- Tested with **Pipecat 1.1.0**
+- Requires **Pipecat 1.8.0+**; tested with **Pipecat 1.12.0**
 - Python 3.11+
 
 ## License

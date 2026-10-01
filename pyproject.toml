@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pipecat-upliftai"
-version = "0.1.0"
+version = "0.2.0"
 description = "UpliftAI TTS plugin for Pipecat"
 readme = "README.md"
 license = "BSD-2-Clause"
@@ -25,7 +25,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "pipecat-ai>=1.1.0",
+    "pipecat-ai>=1.8.0",
     "websockets>=13.1,<16.0",
     "loguru>=0.7",
 ]
