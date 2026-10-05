@@ -34,10 +34,11 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSStoppedFrame,
 )
-from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven
+from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TextAggregationMode, WebsocketTTSService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.tracing.service_decorators import traced_tts
+from pipecat.utils.types import NOT_GIVEN, NotGiven
 
 try:
     from websockets.asyncio.client import connect as websocket_connect
@@ -63,6 +64,19 @@ DEFAULT_URL = "wss://api.upliftai.org/v1/text-to-speech/multi-stream"
 DEFAULT_VOICE_ID = "v_meklc281"
 DEFAULT_OUTPUT_FORMAT: OutputFormat = "PCM_22050_16"
 
+# Pipecat's TTSAudioRawFrame carries raw 16-bit PCM (see AudioRawFrame:
+# num_frames assumes 2 bytes per sample), and this service hands the server's
+# bytes straight to that frame. Only the raw-PCM wire format survives that
+# contract — encoded formats would be played back as noise — so the others are
+# rejected at configuration time instead of producing garbage audio. Telephony
+# pipelines still want PCM here: Pipecat's serializers convert to u-law at the
+# transport edge.
+_SUPPORTED_OUTPUT_FORMATS: frozenset[str] = frozenset({"PCM_22050_16"})
+
+# Speaking-rate bounds enforced by the UpliftAI API (1.0 = normal rate).
+MIN_SPEED = 0.5
+MAX_SPEED = 2.0
+
 # UpliftAI's wire formats hard-lock to specific sample rates. The pipeline
 # rate must match — we fail fast in start() rather than silently overriding,
 # because most output transports trust the rate carried on TTSAudioRawFrame.
@@ -83,15 +97,18 @@ class UpliftAITTSSettings(TTSSettings):
     """Runtime-updatable settings for UpliftAITTSService.
 
     Parameters:
-        output_format: Audio wire format. The implied sample rate is
-            22050 Hz for PCM/WAV/MP3/OGG and 8000 Hz for ULAW; it must
-            match the pipeline's ``audio_out_sample_rate``.
+        output_format: Audio wire format. Only ``"PCM_22050_16"`` is
+            usable in a Pipecat pipeline — see ``_SUPPORTED_OUTPUT_FORMATS``
+            — and the pipeline's ``audio_out_sample_rate`` must be 22050.
         phrase_replacement_config_id: Optional ID of a server-side
             phrase-replacement configuration to apply during synthesis.
+        speed: Speaking rate between 0.5 (half speed) and 2.0 (double
+            speed). ``None`` leaves the server default (1.0) in place.
     """
 
-    output_format: OutputFormat | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    phrase_replacement_config_id: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    output_format: OutputFormat | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    phrase_replacement_config_id: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    speed: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class UpliftAITTSService(WebsocketTTSService):
@@ -104,7 +121,7 @@ class UpliftAITTSService(WebsocketTTSService):
 
     Supported features:
 
-    - Streaming PCM, WAV, MP3, OGG, or ULAW output
+    - Streaming 22.05 kHz raw-PCM output
     - Concurrent requests multiplexed on a single connection
     - Server-side cancellation on bot interruption
     - Optional server-side phrase replacement
@@ -136,9 +153,9 @@ class UpliftAITTSService(WebsocketTTSService):
                 WebSocket upgrade request.
             url: WebSocket URL for the UpliftAI multi-stream endpoint.
             sample_rate: Output sample rate in Hz. If ``None``, inherits
-                from the pipeline. Must match the rate implied by
-                ``output_format`` (22050 for PCM/WAV/MP3/OGG, 8000 for
-                ULAW); ``start()`` raises ``ValueError`` on mismatch.
+                from the pipeline. Must be 22050 to match the supported
+                ``PCM_22050_16`` wire format; ``start()`` raises
+                ``ValueError`` on mismatch.
             settings: Runtime-updatable settings. Caller-provided fields
                 override the defaults; unspecified fields keep their
                 defaults.
@@ -155,6 +172,7 @@ class UpliftAITTSService(WebsocketTTSService):
             language=None,
             output_format=DEFAULT_OUTPUT_FORMAT,
             phrase_replacement_config_id=None,
+            speed=None,
         )
 
         if settings is not None:
@@ -239,7 +257,12 @@ class UpliftAITTSService(WebsocketTTSService):
                 resolved at configuration time.
         """
         await super().start(frame)
-        self._validate_sample_rate(self._settings.output_format)
+        for error in (
+            self._output_format_error(self._settings.output_format),
+            self._speed_error(self._settings.speed),
+        ):
+            if error:
+                raise ValueError(error)
         await self._connect()
 
     async def stop(self, frame: EndFrame) -> None:
@@ -302,39 +325,38 @@ class UpliftAITTSService(WebsocketTTSService):
         }
         await super().on_audio_context_interrupted(context_id)
 
-    async def _update_settings(self, update: TTSSettings) -> dict[str, Any]:
+    async def _update_settings(self, delta: TTSSettings) -> dict[str, Any]:
         """Apply a settings delta.
 
-        Most UpliftAI knobs (voice, output_format, phrase_replacement_config_id)
-        take effect on the next ``synthesize`` request — no reconnect
-        needed. ``output_format`` changes are gated: if the new format
-        implies a sample rate that doesn't match the current pipeline
-        rate, the change is rolled back and an error is pushed.
+        Every UpliftAI knob (voice, output_format,
+        phrase_replacement_config_id, speed) takes effect on the next
+        ``synthesize`` request — no reconnect needed. ``output_format``
+        and ``speed`` are validated here: an unusable value is rolled
+        back to its pre-update value and reported via ``push_error``,
+        so a bad runtime update can't degrade an in-flight session.
 
         Args:
-            update: A TTS settings delta.
+            delta: A TTS settings delta.
 
         Returns:
             Dict mapping changed field names to their pre-update values.
         """
-        changed = await super()._update_settings(update)
+        changed = await super()._update_settings(delta)
         if not changed:
             return changed
 
-        if "output_format" in changed:
-            new_format = self._settings.output_format
-            expected = _FORMAT_SAMPLE_RATES.get(new_format)
-            if expected is None or expected != self.sample_rate:
-                # Roll back to the pre-update value.
-                self._settings.output_format = changed["output_format"]
-                await self.push_error(
-                    error_msg=(
-                        f"{self}: refusing to switch output_format to "
-                        f"{new_format!r} — implied rate {expected} does not "
-                        f"match pipeline sample_rate {self.sample_rate}."
-                    )
-                )
-                changed.pop("output_format", None)
+        for field_name, validate in (
+            ("output_format", self._output_format_error),
+            ("speed", self._speed_error),
+        ):
+            if field_name not in changed:
+                continue
+            error = validate(getattr(self._settings, field_name))
+            if error:
+                # Roll back to the pre-update value and report.
+                setattr(self._settings, field_name, changed[field_name])
+                await self.push_error(error_msg=error)
+                changed.pop(field_name, None)
 
         return changed
 
@@ -390,30 +412,61 @@ class UpliftAITTSService(WebsocketTTSService):
             return self._websocket
         raise Exception("Websocket not connected")
 
-    def _validate_sample_rate(self, output_format: str | None) -> None:
-        """Hard-error if the pipeline rate doesn't match the format.
+    def _output_format_error(self, output_format: Any) -> str | None:
+        """Return why ``output_format`` is unusable here, or ``None`` if it's fine.
 
         Args:
-            output_format: The configured UpliftAI output format.
+            output_format: The UpliftAI output format to check.
 
-        Raises:
-            ValueError: On any mismatch (including unknown formats).
+        Returns:
+            An error message, or ``None`` when the format is usable.
         """
-        expected = _FORMAT_SAMPLE_RATES.get(output_format) if output_format else None
-        if expected is None:
-            raise ValueError(
+        if output_format not in _SUPPORTED_OUTPUT_FORMATS:
+            if output_format in _FORMAT_SAMPLE_RATES:
+                return (
+                    f"{self}: output_format={output_format!r} cannot be used in a "
+                    f"Pipecat pipeline. TTSAudioRawFrame carries raw 16-bit PCM, and "
+                    f"this service forwards UpliftAI's bytes unchanged, so an encoded "
+                    f"or 8-bit format would be played back as noise. Use "
+                    f"{sorted(_SUPPORTED_OUTPUT_FORMATS)[0]!r} — for telephony, let "
+                    f"your transport's serializer convert PCM to u-law at the edge."
+                )
+            return (
                 f"{self}: unsupported output_format={output_format!r}. "
-                f"Supported: {sorted(_FORMAT_SAMPLE_RATES.keys())}."
+                f"Supported: {sorted(_SUPPORTED_OUTPUT_FORMATS)}."
             )
+
+        expected = _FORMAT_SAMPLE_RATES[output_format]
         if self.sample_rate != expected:
-            raise ValueError(
+            return (
                 f"{self}: sample_rate={self.sample_rate} does not match "
                 f"output_format={output_format!r} (UpliftAI emits audio at "
                 f"{expected} Hz). Either set audio_out_sample_rate={expected} "
-                f"on PipelineParams, pass sample_rate={expected} to "
-                f"{type(self).__name__}(...), or pick an output_format whose "
-                f"rate matches your pipeline."
+                f"on PipelineParams, or pass sample_rate={expected} to "
+                f"{type(self).__name__}(...)."
             )
+        return None
+
+    def _speed_error(self, speed: Any) -> str | None:
+        """Return why ``speed`` is invalid, or ``None`` if it's fine.
+
+        Args:
+            speed: The configured speaking rate, or ``None`` to use the
+                server default.
+
+        Returns:
+            An error message, or ``None`` when the speed is acceptable.
+        """
+        if speed is None:
+            return None
+        if isinstance(speed, bool) or not isinstance(speed, (int, float)):
+            return f"{self}: speed must be a number between {MIN_SPEED} and {MAX_SPEED}."
+        if not MIN_SPEED <= speed <= MAX_SPEED:
+            return (
+                f"{self}: speed={speed} is out of range — UpliftAI accepts "
+                f"{MIN_SPEED} to {MAX_SPEED} (1.0 is the normal rate)."
+            )
+        return None
 
     async def _send_cancel(self, request_id: str) -> None:
         """Send a cancel message for a single in-flight request."""
@@ -564,6 +617,9 @@ class UpliftAITTSService(WebsocketTTSService):
             }
             if self._settings.phrase_replacement_config_id:
                 msg["phraseReplacementConfigId"] = self._settings.phrase_replacement_config_id
+            # omitted when unset so the server applies its own default rate
+            if self._settings.speed is not None:
+                msg["speed"] = self._settings.speed
 
             try:
                 await self._get_websocket().send(json.dumps(msg))
