@@ -14,8 +14,17 @@
 
 ## Install
 
+> **PyPI publishing is in progress.** The PyPI organization request is submitted
+> and awaiting approval. Until it lands, install straight from GitHub:
+
 ```bash
-pip install pipecat-upliftai
+pip install "pipecat-upliftai @ git+https://github.com/uplift-initiative/pipecat-upliftai.git@main"
+```
+
+Once published, this becomes:
+
+```bash
+pip install pipecat-upliftai   # not available yet
 ```
 
 ## Quick start

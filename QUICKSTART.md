@@ -19,7 +19,7 @@ source .venv/bin/activate
 
 pip install \
   "pipecat-upliftai @ git+https://github.com/uplift-initiative/pipecat-upliftai.git@main" \
-  "pipecat-ai[openai,silero,webrtc,runner]>=1.1.0" \
+  "pipecat-ai[openai,silero,webrtc,runner]>=1.8.0" \
   python-dotenv
 ```
 
